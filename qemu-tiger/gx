@@ -1,0 +1,10 @@
+#!/bin/bash
+# gx "shell command" — run it inside the guest, print output.
+CMD="$*"
+ID=$(curl -s --data-binary "$CMD" localhost:8765/submit)
+for i in $(seq 1 180); do
+  code=$(curl -s -o /tmp/gxout -w '%{http_code}' "localhost:8765/read?id=$ID")
+  if [ "$code" = "200" ]; then cat /tmp/gxout; exit 0; fi
+  sleep 1
+done
+echo "(gx: timed out after 180s waiting for guest id=$ID)"; exit 1
