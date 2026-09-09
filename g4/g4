@@ -5,8 +5,9 @@
 #   g4 status                   uptime, is isle running, last log lines
 #   g4 push [isle.app]          ship a whole bundle           (default: $G4_APP)
 #   g4 push-bin [isle]          ship only the executable into the remote bundle (default: $G4_BIN)
-#   g4 run [args...]            (re)start the game detached, log to ~/isle-log.txt on the G4
-#   g4 stop                     killall isle
+#   g4 install-runner           install the console-session runner (once; needed by run/stop)
+#   g4 run [args...]            (re)start the game via the console runner, log to ~/isle-log.txt
+#   g4 stop                     stop the game via the console runner
 #   g4 log [-f] [N]             last N lines of the log (default 40), or follow it
 #   g4 shot [name]              screenshot -> $G4_SHOTS/<name>.png, prints the path
 #   g4 crash [--all]            last crash report entry (or the whole file)
@@ -77,10 +78,14 @@ cmd_doctor() {
 echo "os:      $(sw_vers -productVersion 2>/dev/null || uname -sr)  $(uname -m 2>/dev/null)"
 echo "sshd:    $(grep -a -o 'OpenSSH_[0-9][0-9.p]*' /usr/sbin/sshd 2>/dev/null | head -1)"
 echo "user:    ssh=$(id -un)  console=$(who | grep -w console | awk '{print $1}' | head -1)"
-if sudo -S true < /dev/null 2>/dev/null; then echo "sudo:    passwordless OK"; else echo "sudo:    needs a password (add the sudoers line from README-G4.txt)"; fi
+# Probe the ACTUAL NOPASSWD grant the helper relies on (bless --info is read-only),
+# not blanket sudo - Tiger sudo has no -n, and empty stdin makes it fail fast.
+if sudo -S /usr/sbin/bless --info / < /dev/null > /dev/null 2>&1; then echo "sudo:    reboot/shutdown/bless are NOPASSWD (good)"; else echo "sudo:    needs a password - add the NOPASSWD line from README-G4.txt"; fi
 if ps -axo command | grep -q '[A]RDAgent'; then echo "vnc:     ARD agent running"; else echo "vnc:     ARD agent not running (Sharing -> Apple Remote Desktop)"; fi
-if screencapture -x -t png /tmp/g4doc.png 2>/dev/null || screencapture -x /tmp/g4doc.png 2>/dev/null; then echo "screen:  screencapture OK ($(ls -la /tmp/g4doc.png | awk '{print $5}') bytes)"; else echo "screen:  screencapture FAILED (not the console user's session?)"; fi
+screencapture -x /tmp/g4doc.png 2>/dev/null
+if [ -f /tmp/g4doc.png ]; then echo "screen:  screencapture OK ($(ls -la /tmp/g4doc.png | awk '{print $5}') bytes)"; else echo "screen:  screencapture FAILED (not the console user's session?)"; fi
 rm -f /tmp/g4doc.png
+if [ -f "$HOME/.g4/runner.sh" ] && [ -f "$HOME/.g4/runner.log" ]; then echo "runner:  installed and has run ($(cat "$HOME/.g4/runner.log"))"; elif [ -f "$HOME/.g4/runner.sh" ]; then echo "runner:  installed, not started yet (starts at next login; g4 reboot)"; else echo "runner:  NOT installed (g4 install-runner) - g4 run needs it (SSH exec of a windowed app aborts on Tiger)"; fi
 if [ -x "$APP/Contents/MacOS/isle" ]; then echo "app:     $(ls -la "$APP/Contents/MacOS/isle" | awk '{print $5, $6, $7, $8}')"; else echo "app:     no $APP in home (g4 push)"; fi
 if [ -d gamedata/LEGO ]; then echo "assets:  gamedata $(du -sh gamedata 2>/dev/null | cut -f1)"; else echo "assets:  no gamedata (g4 assets)"; fi
 INI="$HOME/Library/Application Support/isledecomp/isle/isle.ini"
@@ -146,26 +151,83 @@ cmd_setup_key() {
 
 # --- running ---------------------------------------------------------------
 
+# On Tiger a windowed app cannot be launched by a raw SSH exec: the SSH session
+# is a different Mach bootstrap namespace than the console GUI session, so the
+# game aborts in CFMessagePort/bootstrap_register. `open` reaches the right
+# session but injects a -psn_ argument isle rejects. So the game is launched by
+# a small runner (install-runner) that lives IN the console session; run/stop
+# just hand it a request file over SSH.
 cmd_run() {
-  rscript APP="$G4_REMOTE_APP" LOG="$G4_REMOTE_LOG" ISLE_ARGS="$*" <<'REMOTE'
-if ps -axo pid,command | grep "[/]$APP/Contents/MacOS/isle" >/dev/null; then killall isle 2>/dev/null; sleep 1; fi
+  rscript ARGS="$*" APP="$G4_REMOTE_APP" LOG="$G4_REMOTE_LOG" <<'REMOTE'
 [ -x "$APP/Contents/MacOS/isle" ] || { echo "no $APP/Contents/MacOS/isle on the G4 (g4 push)"; exit 1; }
+[ -f "$HOME/.g4/runner.sh" ] || { echo "runner not installed (g4 install-runner)"; exit 1; }
 [ -f "$LOG" ] && mv -f "$LOG" "${LOG%.txt}.prev.txt"
-# Detached from this SSH session: ignore INT/HUP, no inherited fds, exit code appended to the log.
-nohup sh -c "trap '' INT HUP; ./$APP/Contents/MacOS/isle $ISLE_ARGS > $LOG 2>&1; echo EXITCODE=\$? >> $LOG" > /dev/null 2>&1 < /dev/null &
+mkdir -p "$HOME/.g4"; rm -f "$HOME/.g4/ack"
+printf 'run\n%s\n' "$ARGS" > "$HOME/.g4/req.tmp" && mv "$HOME/.g4/req.tmp" "$HOME/.g4/req"
+n=0; while [ ! -f "$HOME/.g4/ack" ] && [ "$n" -lt 15 ]; do sleep 1; n=$((n+1)); done
+[ -f "$HOME/.g4/ack" ] || { echo "runner did not pick up the request in 15s (is it loaded? g4 doctor / g4 reboot)"; exit 1; }
 sleep 3
-if ps -axo pid,command | grep "[/]$APP/Contents/MacOS/isle" >/dev/null; then
-  echo "isle running: $(ps -axo pid,command | grep "[/]$APP/Contents/MacOS/isle" | head -1)"
-  echo "--- $LOG so far ---"; cat "$LOG"
-else
-  echo "isle did NOT stay up. $LOG:"; cat "$LOG" 2>/dev/null; exit 1
-fi
+if ps -axo command | grep -q "[/]Contents/MacOS/isle"; then echo "isle running (launched by the console runner)"; else echo "isle did NOT stay up; $LOG:"; fi
+tail -12 "$LOG" 2>/dev/null
 REMOTE
 }
 
 cmd_stop() {
-  if [ "${1:-}" = quiet ]; then rsh 'killall isle 2>/dev/null; true'
-  else rsh 'if killall isle 2>/dev/null; then echo "isle stopped"; else echo "isle was not running"; fi'; fi
+  if [ "${1:-}" = quiet ]; then
+    rsh 'mkdir -p "$HOME/.g4"; printf "stop\n" > "$HOME/.g4/req.tmp" && mv "$HOME/.g4/req.tmp" "$HOME/.g4/req"; killall isle 2>/dev/null; true'
+  else
+    rsh 'mkdir -p "$HOME/.g4"; printf "stop\n" > "$HOME/.g4/req.tmp" && mv "$HOME/.g4/req.tmp" "$HOME/.g4/req"; if killall isle 2>/dev/null; then echo "isle stopped"; else echo "isle was not running"; fi'
+  fi
+}
+
+# The console-session runner: a LaunchAgent-started loop that owns the game so
+# the SSH side never has to. Installed once (survives reboots; auto-login brings
+# it back). Starts at the next console login - `g4 reboot` after install.
+runner_script() {
+  cat <<RUNNER
+#!/bin/sh
+# g4 console-session runner (installed by \`g4 install-runner\`). Lives in the
+# Aqua login session so it can open the game's window; the SSH side hands it
+# requests via \$HOME/.g4/req.
+G4="\$HOME/.g4"; APP="\$HOME/$G4_REMOTE_APP"; LOG="\$HOME/$G4_REMOTE_LOG"
+mkdir -p "\$G4"; echo "up \$(date)" > "\$G4/runner.log"
+while :; do
+  if [ -f "\$G4/req" ]; then
+    verb=\$(sed -n 1p "\$G4/req"); args=\$(sed -n 2p "\$G4/req"); rm -f "\$G4/req"
+    killall isle 2>/dev/null; sleep 1
+    if [ "\$verb" = run ]; then
+      ( trap "" INT HUP; "\$APP/Contents/MacOS/isle" \$args > "\$LOG" 2>&1; echo "EXITCODE=\$?" >> "\$LOG" ) &
+      echo "\$!" > "\$G4/isle.pid"
+    fi
+    echo "\$verb \$(date +%s)" > "\$G4/ack"
+  fi
+  sleep 1
+done
+RUNNER
+}
+runner_plist() {
+  cat <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.isle.g4runner</string>
+  <key>ProgramArguments</key><array><string>/bin/sh</string><string>__RUNNER__</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict></plist>
+PLIST
+}
+cmd_install_runner() {
+  local home; home=$(rsh 'printf %s "$HOME"') || die "cannot reach $G4_HOST"
+  rsh 'mkdir -p "$HOME/.g4" "$HOME/Library/LaunchAgents"'
+  runner_script | rsh 'cat > "$HOME/.g4/runner.sh" && chmod +x "$HOME/.g4/runner.sh"' || die "could not write runner.sh"
+  runner_plist | sed "s#__RUNNER__#$home/.g4/runner.sh#" | rsh 'cat > "$HOME/Library/LaunchAgents/com.isle.g4runner.plist"' || die "could not write the LaunchAgent"
+  # Do NOT launchctl-load over SSH: that loads into the SSH session's launchd
+  # (wrong domain - can't open windows) AND the RunAtLoad loop holds the SSH
+  # channel open. The Aqua session's launchd auto-loads it at the next console
+  # login, which auto-login provides after a reboot.
+  echo "runner installed on $G4_HOST. Start it by logging the console session in fresh:"
+  echo "    g4 reboot && g4 wait     # auto-login loads the runner in the Aqua session"
 }
 
 cmd_log() {
@@ -179,7 +241,9 @@ cmd_log() {
 cmd_shot() {
   local name="${1:-$(date +%Y%m%d-%H%M%S)}" out
   mkdir -p "$G4_SHOTS"; out="$G4_SHOTS/${name%.png}.png"
-  rsh 'screencapture -x -t png /tmp/g4shot.png 2>/dev/null || screencapture -x /tmp/g4shot.png 2>/dev/null; cat /tmp/g4shot.png 2>/dev/null; rm -f /tmp/g4shot.png' > "$out"
+  # Tiger's screencapture takes NO -t flag (it returns 0 but writes nothing);
+  # plain `screencapture -x` writes a PNG and works fine over SSH.
+  rsh 'screencapture -x /tmp/g4shot.png 2>/dev/null; cat /tmp/g4shot.png 2>/dev/null; rm -f /tmp/g4shot.png' > "$out"
   if [ "$(head -c 4 "$out" 2>/dev/null | od -An -tx1 | tr -d ' \n')" != "89504e47" ]; then
     rm -f "$out"; die "no PNG came back; screencapture needs the console user's window server (see g4 doctor)"
   fi
@@ -286,7 +350,7 @@ cmd_boot() {
   rsh 'sudo -S reboot < /dev/null' >/dev/null 2>&1; echo "blessed $target ($flags); rebooting"
 }
 
-usage() { sed -n '2,27p' "$0"; }
+usage() { sed -n '2,28p' "$0"; }
 
 main() {
   local cmd="${1:-help}"; shift || true
@@ -294,6 +358,7 @@ main() {
     doctor) cmd_doctor "$@";;   status) cmd_status "$@";;
     push) cmd_push "$@";;       push-bin) cmd_push_bin "$@";;
     assets) cmd_assets "$@";;   ini) cmd_ini "$@";;          setup-key) cmd_setup_key "$@";;
+    install-runner) cmd_install_runner "$@";;
     run) cmd_run "$@";;         stop) cmd_stop "$@";;        log) cmd_log "$@";;
     shot) cmd_shot "$@";;       crash) cmd_crash "$@";;
     keys) cmd_keys "$@";;       key) cmd_key "$@";;
