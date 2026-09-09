@@ -81,11 +81,14 @@ echo "user:    ssh=$(id -un)  console=$(who | grep -w console | awk '{print $1}'
 # Probe the ACTUAL NOPASSWD grant the helper relies on (bless --info is read-only),
 # not blanket sudo - Tiger sudo has no -n, and empty stdin makes it fail fast.
 if sudo -S /usr/sbin/bless --info / < /dev/null > /dev/null 2>&1; then echo "sudo:    reboot/shutdown/bless are NOPASSWD (good)"; else echo "sudo:    needs a password - add the NOPASSWD line from README-G4.txt"; fi
-if ps -axo command | grep -q '[A]RDAgent'; then echo "vnc:     ARD agent running"; else echo "vnc:     ARD agent not running (Sharing -> Apple Remote Desktop)"; fi
+if ps -axo command | grep -qE '[A]RDAgent|[A]ppleVNCServer|[S]creensharingd'; then echo "vnc:     VNC server running (Tiger: ARD agent / Leopard: Screen Sharing)"; else echo "vnc:     no VNC server (Tiger: Sharing -> Apple Remote Desktop; Leopard: Sharing -> Screen Sharing)"; fi
 screencapture -x /tmp/g4doc.png 2>/dev/null
-if [ -f /tmp/g4doc.png ]; then echo "screen:  screencapture OK ($(ls -la /tmp/g4doc.png | awk '{print $5}') bytes)"; else echo "screen:  screencapture FAILED (not the console user's session?)"; fi
+if [ -f /tmp/g4doc.png ]; then
+  SZ=$(ls -la /tmp/g4doc.png | awk '{print $5}')
+  if [ "$SZ" -lt 20000 ]; then echo "screen:  direct SSH capture is a near-black frame ($SZ bytes): Leopard+ hides the display from SSH sessions; g4 shot goes through the runner"; else echo "screen:  screencapture over SSH OK ($SZ bytes)"; fi
+else echo "screen:  screencapture FAILED"; fi
 rm -f /tmp/g4doc.png
-if [ -f "$HOME/.g4/runner.sh" ] && [ -f "$HOME/.g4/runner.log" ]; then echo "runner:  installed and has run ($(cat "$HOME/.g4/runner.log"))"; elif [ -f "$HOME/.g4/runner.sh" ]; then echo "runner:  installed, not started yet (starts at next login; g4 reboot)"; else echo "runner:  NOT installed (g4 install-runner) - g4 run needs it (SSH exec of a windowed app aborts on Tiger)"; fi
+if [ -f "$HOME/.g4/runner.sh" ] && [ -f "$HOME/.g4/runner.log" ]; then echo "runner:  installed and has run ($(cat "$HOME/.g4/runner.log"))"; elif [ -f "$HOME/.g4/runner.sh" ]; then echo "runner:  installed, not started yet (starts at next login; g4 reboot)"; else echo "runner:  NOT installed (g4 install-runner) - g4 run needs it (SSH exec of a windowed app aborts on Tiger/Leopard)"; fi
 if [ -x "$APP/Contents/MacOS/isle" ]; then echo "app:     $(ls -la "$APP/Contents/MacOS/isle" | awk '{print $5, $6, $7, $8}')"; else echo "app:     no $APP in home (g4 push)"; fi
 if [ -d gamedata/LEGO ]; then echo "assets:  gamedata $(du -sh gamedata 2>/dev/null | cut -f1)"; else echo "assets:  no gamedata (g4 assets)"; fi
 INI="$HOME/Library/Application Support/isledecomp/isle/isle.ini"
@@ -194,11 +197,13 @@ mkdir -p "\$G4"; echo "up \$(date)" > "\$G4/runner.log"
 while :; do
   if [ -f "\$G4/req" ]; then
     verb=\$(sed -n 1p "\$G4/req"); args=\$(sed -n 2p "\$G4/req"); rm -f "\$G4/req"
-    killall isle 2>/dev/null; sleep 1
-    if [ "\$verb" = run ]; then
-      ( trap "" INT HUP; "\$APP/Contents/MacOS/isle" \$args > "\$LOG" 2>&1; echo "EXITCODE=\$?" >> "\$LOG" ) &
-      echo "\$!" > "\$G4/isle.pid"
-    fi
+    case "\$verb" in
+      run)  killall isle 2>/dev/null; sleep 1
+            ( trap "" INT HUP; "\$APP/Contents/MacOS/isle" \$args > "\$LOG" 2>&1; echo "EXITCODE=\$?" >> "\$LOG" ) &
+            echo "\$!" > "\$G4/isle.pid" ;;
+      stop) killall isle 2>/dev/null ;;
+      shot) rm -f "\$G4/shot.png"; screencapture -x "\$G4/shot.png" 2>/dev/null ;;
+    esac
     echo "\$verb \$(date +%s)" > "\$G4/ack"
   fi
   sleep 1
@@ -241,12 +246,24 @@ cmd_log() {
 cmd_shot() {
   local name="${1:-$(date +%Y%m%d-%H%M%S)}" out
   mkdir -p "$G4_SHOTS"; out="$G4_SHOTS/${name%.png}.png"
-  # Tiger's screencapture takes NO -t flag (it returns 0 but writes nothing);
-  # plain `screencapture -x` writes a PNG and works fine over SSH.
-  rsh 'screencapture -x /tmp/g4shot.png 2>/dev/null; cat /tmp/g4shot.png 2>/dev/null; rm -f /tmp/g4shot.png' > "$out"
+  # Capture from INSIDE the console session via the runner: on Leopard and later an
+  # SSH session's screencapture returns a black frame (WindowServer session isolation).
+  # Tiger has no such isolation, so direct SSH capture is the fallback there.
+  # Tiger's screencapture takes NO -t flag (it returns 0 but writes nothing): plain -x only.
+  rscript <<'REMOTE' > "$out"
+if [ -f "$HOME/.g4/runner.sh" ] && [ -f "$HOME/.g4/runner.log" ]; then
+  rm -f "$HOME/.g4/ack" "$HOME/.g4/shot.png"
+  printf 'shot\n' > "$HOME/.g4/req.tmp" && mv "$HOME/.g4/req.tmp" "$HOME/.g4/req"
+  n=0; while [ ! -f "$HOME/.g4/ack" ] && [ "$n" -lt 12 ]; do sleep 1; n=$((n+1)); done
+  if [ -s "$HOME/.g4/shot.png" ]; then cat "$HOME/.g4/shot.png"; rm -f "$HOME/.g4/shot.png"; exit 0; fi
+fi
+screencapture -x /tmp/g4shot.png 2>/dev/null; cat /tmp/g4shot.png 2>/dev/null; rm -f /tmp/g4shot.png
+REMOTE
   if [ "$(head -c 4 "$out" 2>/dev/null | od -An -tx1 | tr -d ' \n')" != "89504e47" ]; then
-    rm -f "$out"; die "no PNG came back; screencapture needs the console user's window server (see g4 doctor)"
+    rm -f "$out"; die "no PNG came back (runner not running and direct capture failed; see g4 doctor)"
   fi
+  local sz; sz=$(wc -c < "$out" | tr -d ' ')
+  [ "$sz" -lt 20000 ] && note "warning: $sz-byte image is probably a black frame - on Leopard+ only the console runner can see the display (is it running? g4 doctor)"
   echo "$out"
 }
 
