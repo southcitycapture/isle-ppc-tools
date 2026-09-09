@@ -1,0 +1,13 @@
+# ~/.config/g4/config  (sh syntax; every line optional, these are the defaults)
+G4_HOST=g4                                   # ssh alias from ~/.ssh/config (tiger-vm = the QEMU guest)
+G4_VNC=192.168.0.200                         # host[:port] for "g4 vnc"   (tiger-vm: localhost:5901)
+G4_HUB=littlejelly                           # ssh alias of the box that can reach the smart plug
+G4_APP=$HOME/Apps/islandPowerPC/g4-weekend/isle.app
+G4_BIN=$HOME/Apps/isle-portable/build-tiger/isle
+G4_ASSETS=$HOME/Apps/islandPowerPC/gamedata
+G4_SHOTS=$HOME/Apps/islandPowerPC/g4-shots
+G4_REMOTE_APP=isle.app                       # relative to the G4 user's home
+G4_REMOTE_LOG=isle-log.txt
+G4_OS9_FOLDER="/Volumes/OS9/System Folder"   # Phase 4
+#G4_PLUG_KIND=shelly                         # shelly | kasa   (Phase 3)
+#G4_PLUG_ADDR=192.168.50.60

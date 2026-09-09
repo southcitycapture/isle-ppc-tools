@@ -1,0 +1,307 @@
+#!/bin/bash
+# g4 - drive the Power Mac G4 test bench over SSH, from the Mac, from anywhere.
+#
+#   g4 doctor                   check the SSH path, negotiated algorithms, sudo, VNC, screen, assets
+#   g4 status                   uptime, is isle running, last log lines
+#   g4 push [isle.app]          ship a whole bundle           (default: $G4_APP)
+#   g4 push-bin [isle]          ship only the executable into the remote bundle (default: $G4_BIN)
+#   g4 run [args...]            (re)start the game detached, log to ~/isle-log.txt on the G4
+#   g4 stop                     killall isle
+#   g4 log [-f] [N]             last N lines of the log (default 40), or follow it
+#   g4 shot [name]              screenshot -> $G4_SHOTS/<name>.png, prints the path
+#   g4 crash [--all]            last crash report entry (or the whole file)
+#   g4 keys "text"              type text into the game (osascript; needs assistive access)
+#   g4 key NAME [count]         press esc|return|space|tab|up|down|left|right|delete
+#   g4 pull REMOTE [LOCAL]      fetch any file from the G4
+#   g4 ssh [cmd...]             interactive shell, or run one command
+#   g4 wait [seconds]           block until the G4 answers SSH again (after reboot/power cycle)
+#   g4 vnc                      open Screen Sharing to the G4
+#   g4 reboot | shutdown        via passwordless sudo (see README-G4.txt)
+#   g4 power on|off|cycle|status   smart plug, driven from the hub (littlejelly)
+#   g4 boot tiger|os9 [--once]  bless the other system and reboot (Phase 4, untested)
+#   g4 setup-key                install ~/.ssh/id_rsa_g4.pub on the G4 (asks for the password once)
+#   g4 assets                   ship gamedata/ (519 MB) once
+#   g4 ini                      write isle.ini on the G4 pointing at ~/gamedata
+#
+# Config: ~/.config/g4/config (sh syntax) or environment; see config.example.
+# Dry run against the QEMU Tiger guest:   G4_HOST=tiger-vm G4_VNC=localhost:5901 g4 doctor
+#
+# Remote side is Tiger 10.4: bash 2.05b, GNU tar 1.14, BSD ps, screencapture, osascript, nohup.
+# Everything sent to it is plain POSIX sh.
+
+set -u
+
+CONFIG="${G4_CONFIG:-$HOME/.config/g4/config}"
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+: "${G4_HOST:=g4}"                                             # ssh alias from ~/.ssh/config
+: "${G4_VNC:=192.168.0.200}"                                   # host[:port] for vnc://
+: "${G4_HUB:=littlejelly}"                                     # ssh alias of the box that reaches the smart plug
+: "${G4_APP:=$HOME/Apps/islandPowerPC/g4-weekend/isle.app}"    # bundle to push
+: "${G4_BIN:=$HOME/Apps/isle-portable/build-tiger/isle}"       # bare executable from build-tiger.sh
+: "${G4_ASSETS:=$HOME/Apps/islandPowerPC/gamedata}"            # game assets (LEGO/ inside)
+: "${G4_SHOTS:=$HOME/Apps/islandPowerPC/g4-shots}"             # screenshots land here
+: "${G4_REMOTE_APP:=isle.app}"                                 # relative to $HOME on the G4, no spaces
+: "${G4_REMOTE_LOG:=isle-log.txt}"
+: "${G4_OS9_FOLDER:=/Volumes/OS9/System Folder}"
+: "${G4_PLUG_KIND:=}"                                          # shelly | kasa
+: "${G4_PLUG_ADDR:=}"                                          # plug's address on the Wi-Fi network
+
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o LogLevel=ERROR)
+
+die()  { echo "g4: $*" >&2; exit 1; }
+note() { echo "g4: $*" >&2; }
+rsh()  { ssh "${SSH_OPTS[@]}" "$G4_HOST" "$@"; }
+# rscript VAR=value ... <<'REMOTE'  -> runs the heredoc as sh on the G4 with those variables set
+rscript() {
+  local env=""
+  for kv in "$@"; do env="$env $(shquote "$kv")"; done
+  rsh "env$env sh -s"
+}
+shquote() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }
+hub() { ssh "${SSH_OPTS[@]}" "$G4_HUB" "$@"; }
+tar_stream() { # tar_stream DIR NAME  -> gzip'd ustar on stdout, no Apple metadata (Tiger's GNU tar 1.14 reads it)
+  COPYFILE_DISABLE=1 tar --format ustar --no-xattrs --no-acls --no-mac-metadata -C "$1" -czf - "$2"
+}
+
+# --- inspection ------------------------------------------------------------
+
+cmd_doctor() {
+  echo "target:  $G4_HOST -> $(ssh -G "$G4_HOST" true 2>/dev/null | awk '/^user /{u=$2} /^hostname /{h=$2} /^port /{p=$2} END{print u"@"h":"p}')"
+  local out rc
+  out=$(ssh -vv "${SSH_OPTS[@]}" -o LogLevel=DEBUG2 "$G4_HOST" true 2>&1); rc=$?
+  echo "$out" | grep -E 'remote software version|kex: algorithm:|kex: host key algorithm:|Authenticated to|Permission denied|Connection (refused|timed out|closed)|Unable to negotiate|no matching|Host is down|No route' \
+    | sed -E 's/^debug[0-9]+: //; s/^/  /'
+  [ $rc -eq 0 ] || die "ssh to $G4_HOST failed (rc=$rc). Subnet route on? Key installed (g4 setup-key)?"
+  rscript APP="$G4_REMOTE_APP" <<'REMOTE'
+echo "os:      $(sw_vers -productVersion 2>/dev/null || uname -sr)  $(uname -m 2>/dev/null)"
+echo "sshd:    $(grep -a -o 'OpenSSH_[0-9][0-9.p]*' /usr/sbin/sshd 2>/dev/null | head -1)"
+echo "user:    ssh=$(id -un)  console=$(who | grep -w console | awk '{print $1}' | head -1)"
+if sudo -S true < /dev/null 2>/dev/null; then echo "sudo:    passwordless OK"; else echo "sudo:    needs a password (add the sudoers line from README-G4.txt)"; fi
+if ps -axo command | grep -q '[A]RDAgent'; then echo "vnc:     ARD agent running"; else echo "vnc:     ARD agent not running (Sharing -> Apple Remote Desktop)"; fi
+if screencapture -x -t png /tmp/g4doc.png 2>/dev/null || screencapture -x /tmp/g4doc.png 2>/dev/null; then echo "screen:  screencapture OK ($(ls -la /tmp/g4doc.png | awk '{print $5}') bytes)"; else echo "screen:  screencapture FAILED (not the console user's session?)"; fi
+rm -f /tmp/g4doc.png
+if [ -x "$APP/Contents/MacOS/isle" ]; then echo "app:     $(ls -la "$APP/Contents/MacOS/isle" | awk '{print $5, $6, $7, $8}')"; else echo "app:     no $APP in home (g4 push)"; fi
+if [ -d gamedata/LEGO ]; then echo "assets:  gamedata $(du -sh gamedata 2>/dev/null | cut -f1)"; else echo "assets:  no gamedata (g4 assets)"; fi
+INI="$HOME/Library/Application Support/isledecomp/isle/isle.ini"
+if [ -f "$INI" ]; then echo "ini:     $(tr '\n' ' ' < "$INI")"; else echo "ini:     none (g4 ini)"; fi
+REMOTE
+}
+
+cmd_status() {
+  rscript APP="$G4_REMOTE_APP" LOG="$G4_REMOTE_LOG" <<'REMOTE'
+echo "host:    $(hostname)"
+echo "up:     $(uptime)"
+if ps -axo pid,command | grep "[/]$APP/Contents/MacOS/isle" >/dev/null; then
+  echo "isle:    running  $(ps -axo pid,command | grep "[/]$APP/Contents/MacOS/isle" | head -1)"
+else
+  echo "isle:    not running"
+fi
+echo "--- tail $LOG ---"
+tail -5 "$LOG" 2>/dev/null || echo "(no log yet)"
+REMOTE
+}
+
+# --- shipping --------------------------------------------------------------
+
+cmd_push() {
+  local bundle="${1:-$G4_APP}"
+  [ -d "$bundle/Contents/MacOS" ] || die "not an app bundle: $bundle"
+  local base dir; base=$(basename "$bundle"); dir=$(dirname "$bundle")
+  case "$G4_REMOTE_APP$base" in *" "*) die "no spaces in bundle names, please";; esac
+  cmd_stop quiet
+  note "pushing $bundle -> $G4_HOST:~/$G4_REMOTE_APP"
+  tar_stream "$dir" "$base" | rsh "rm -rf .g4-new && mkdir .g4-new && tar -xzf - -C .g4-new && rm -rf $G4_REMOTE_APP && mv .g4-new/$base $G4_REMOTE_APP && rmdir .g4-new && echo pushed: && ls -la $G4_REMOTE_APP/Contents/MacOS/isle && (ls -la $G4_REMOTE_APP/Contents/Frameworks/ 2>/dev/null; true)" \
+    || die "push failed"
+}
+
+cmd_push_bin() {
+  local bin="${1:-$G4_BIN}"
+  [ -f "$bin" ] || die "no executable at $bin (run tiger/build-tiger.sh first, or pass a path)"
+  file "$bin" | grep -q -i 'ppc\|powerpc' || note "warning: $(file "$bin" | cut -d: -f2-) does not look like a PowerPC binary"
+  cmd_stop quiet
+  note "pushing $bin -> $G4_HOST:~/$G4_REMOTE_APP/Contents/MacOS/isle"
+  rsh "cat > $G4_REMOTE_APP/Contents/MacOS/isle.new && chmod 755 $G4_REMOTE_APP/Contents/MacOS/isle.new && mv -f $G4_REMOTE_APP/Contents/MacOS/isle.new $G4_REMOTE_APP/Contents/MacOS/isle && ls -la $G4_REMOTE_APP/Contents/MacOS/isle" < "$bin" \
+    || die "push-bin failed (is $G4_REMOTE_APP on the G4 yet? g4 push)"
+}
+
+cmd_assets() {
+  [ -d "$G4_ASSETS/LEGO" ] || die "no LEGO/ inside $G4_ASSETS"
+  [ "$(basename "$G4_ASSETS")" = gamedata ] || die "assets dir must be named gamedata"
+  note "sending $(du -sh "$G4_ASSETS" | cut -f1) of assets; this takes a few minutes on the wire"
+  tar_stream "$(dirname "$G4_ASSETS")" gamedata | rsh 'tar -xzf - && echo "assets:" && du -sh gamedata' || die "assets failed"
+}
+
+cmd_ini() {
+  rsh 'd="$HOME/Library/Application Support/isledecomp/isle"; mkdir -p "$d" && printf "[isle]\ndiskpath = %s/gamedata\ncdpath = %s/gamedata\nFull Screen = false\n" "$HOME" "$HOME" > "$d/isle.ini" && cat "$d/isle.ini"'
+}
+
+cmd_setup_key() {
+  local pub="$HOME/.ssh/id_rsa_g4.pub"
+  [ -f "$pub" ] || die "no $pub (ssh-keygen -t rsa -b 3072 -N '' -f ~/.ssh/id_rsa_g4)"
+  note "installing $pub on $G4_HOST; enter the G4 user's password when asked"
+  ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive "$G4_HOST" \
+    'umask 077; mkdir -p .ssh; cat >> .ssh/authorized_keys; echo "installed; $(wc -l < .ssh/authorized_keys | tr -d " ") key(s) on file"' < "$pub"
+}
+
+# --- running ---------------------------------------------------------------
+
+cmd_run() {
+  rscript APP="$G4_REMOTE_APP" LOG="$G4_REMOTE_LOG" ISLE_ARGS="$*" <<'REMOTE'
+if ps -axo pid,command | grep "[/]$APP/Contents/MacOS/isle" >/dev/null; then killall isle 2>/dev/null; sleep 1; fi
+[ -x "$APP/Contents/MacOS/isle" ] || { echo "no $APP/Contents/MacOS/isle on the G4 (g4 push)"; exit 1; }
+[ -f "$LOG" ] && mv -f "$LOG" "${LOG%.txt}.prev.txt"
+# Detached from this SSH session: ignore INT/HUP, no inherited fds, exit code appended to the log.
+nohup sh -c "trap '' INT HUP; ./$APP/Contents/MacOS/isle $ISLE_ARGS > $LOG 2>&1; echo EXITCODE=\$? >> $LOG" > /dev/null 2>&1 < /dev/null &
+sleep 3
+if ps -axo pid,command | grep "[/]$APP/Contents/MacOS/isle" >/dev/null; then
+  echo "isle running: $(ps -axo pid,command | grep "[/]$APP/Contents/MacOS/isle" | head -1)"
+  echo "--- $LOG so far ---"; cat "$LOG"
+else
+  echo "isle did NOT stay up. $LOG:"; cat "$LOG" 2>/dev/null; exit 1
+fi
+REMOTE
+}
+
+cmd_stop() {
+  if [ "${1:-}" = quiet ]; then rsh 'killall isle 2>/dev/null; true'
+  else rsh 'if killall isle 2>/dev/null; then echo "isle stopped"; else echo "isle was not running"; fi'; fi
+}
+
+cmd_log() {
+  if [ "${1:-}" = -f ]; then
+    note "following ~/$G4_REMOTE_LOG on $G4_HOST (Ctrl-C to stop)"
+    exec ssh "${SSH_OPTS[@]}" "$G4_HOST" "tail -n 20 -f $G4_REMOTE_LOG"
+  fi
+  rsh "tail -n ${1:-40} $G4_REMOTE_LOG 2>/dev/null || echo '(no log yet)'"
+}
+
+cmd_shot() {
+  local name="${1:-$(date +%Y%m%d-%H%M%S)}" out
+  mkdir -p "$G4_SHOTS"; out="$G4_SHOTS/${name%.png}.png"
+  rsh 'screencapture -x -t png /tmp/g4shot.png 2>/dev/null || screencapture -x /tmp/g4shot.png 2>/dev/null; cat /tmp/g4shot.png 2>/dev/null; rm -f /tmp/g4shot.png' > "$out"
+  if [ "$(head -c 4 "$out" 2>/dev/null | od -An -tx1 | tr -d ' \n')" != "89504e47" ]; then
+    rm -f "$out"; die "no PNG came back; screencapture needs the console user's window server (see g4 doctor)"
+  fi
+  echo "$out"
+}
+
+cmd_crash() {
+  local f='$HOME/Library/Logs/CrashReporter/isle.crash.log'
+  if [ "${1:-}" = --all ]; then rsh "cat \"$f\" 2>/dev/null || echo '(no crash log)'"; return; fi
+  rsh "cat \"$f\" 2>/dev/null" | last_entry
+}
+# Tiger's CrashReporter appends entries separated by a line of asterisks; print the last one.
+last_entry() {
+  awk '
+    /^\*\*\*\*\*/ { n++; next }
+    { block[n] = block[n] $0 "\n"; seen[n] = 1 }
+    END {
+      if (!(n in seen)) { print "(no crash log, or the last entry is empty)"; exit }
+      total = 0; for (k in seen) total++
+      printf "--- crash entry %d of %d ---\n%s", total, total, block[n]
+    }'
+}
+
+cmd_keys() {
+  [ $# -ge 1 ] || die 'usage: g4 keys "text"'
+  local t="$1"; t=${t//\\/\\\\}; t=${t//\"/\\\"}
+  rscript TEXT="$t" <<'REMOTE'
+osascript -e 'tell application "System Events"' \
+  -e '  try' -e '    set frontmost of process "isle" to true' \
+  -e '  on error' -e '    set frontmost of process "Isle Portable" to true' -e '  end try' \
+  -e "  keystroke \"$TEXT\"" \
+  -e 'end tell' && echo "typed: $TEXT"
+REMOTE
+}
+
+cmd_key() {
+  local code count="${2:-1}"
+  case "${1:-}" in
+    esc|escape) code=53;; return|enter) code=36;; space) code=49;; tab) code=48;;
+    up) code=126;; down) code=125;; left) code=123;; right) code=124;; delete|backspace) code=51;;
+    *) die "usage: g4 key esc|return|space|tab|up|down|left|right|delete [count]";;
+  esac
+  rscript CODE="$code" COUNT="$count" <<'REMOTE'
+osascript -e 'tell application "System Events"' \
+  -e '  try' -e '    set frontmost of process "isle" to true' \
+  -e '  on error' -e '    set frontmost of process "Isle Portable" to true' -e '  end try' \
+  -e "  repeat $COUNT times" -e "    key code $CODE" -e '    delay 0.15' -e '  end repeat' \
+  -e 'end tell' && echo "pressed key code $CODE x$COUNT"
+REMOTE
+}
+
+# --- plumbing --------------------------------------------------------------
+
+cmd_pull() {
+  [ $# -ge 1 ] || die "usage: g4 pull REMOTE_PATH [LOCAL_PATH]"
+  local dest="${2:-$(basename "$1")}"
+  rsh "cat $(shquote "$1")" > "$dest" || { rm -f "$dest"; die "pull failed"; }
+  echo "$dest ($(wc -c < "$dest" | tr -d ' ') bytes)"
+}
+
+cmd_ssh() { exec ssh "$G4_HOST" "$@"; }
+
+cmd_wait() {
+  local limit="${1:-300}" t=0
+  while ! rsh true 2>/dev/null; do
+    t=$((t+5)); [ $t -ge "$limit" ] && die "$G4_HOST still not answering after ${limit}s"
+    sleep 5
+  done
+  echo "$G4_HOST is up ($(rsh uptime))"
+}
+
+cmd_vnc() { open "vnc://$G4_VNC"; }
+
+cmd_reboot()   { rsh 'sudo -S true < /dev/null 2>/dev/null' || die "sudo needs a password on the G4; add the sudoers line from README-G4.txt"; rsh 'sudo -S reboot < /dev/null' >/dev/null 2>&1; echo "reboot requested; g4 wait"; }
+cmd_shutdown() { rsh 'sudo -S true < /dev/null 2>/dev/null' || die "sudo needs a password on the G4; add the sudoers line from README-G4.txt"; rsh 'sudo -S shutdown -h now < /dev/null' >/dev/null 2>&1; echo "shutdown requested; bring it back with g4 power cycle"; }
+
+cmd_power() {
+  local what="${1:-status}" c
+  [ -n "$G4_PLUG_KIND" ] && [ -n "$G4_PLUG_ADDR" ] || die "no smart plug configured: set G4_PLUG_KIND (shelly|kasa) and G4_PLUG_ADDR in $CONFIG"
+  case "$G4_PLUG_KIND:$what" in
+    shelly:on)     c="curl -s 'http://$G4_PLUG_ADDR/relay/0?turn=on'";;
+    shelly:off)    c="curl -s 'http://$G4_PLUG_ADDR/relay/0?turn=off'";;
+    shelly:status) c="curl -s 'http://$G4_PLUG_ADDR/relay/0'";;
+    kasa:on)       c="python3 -m kasa --host $G4_PLUG_ADDR on";;
+    kasa:off)      c="python3 -m kasa --host $G4_PLUG_ADDR off";;
+    kasa:status)   c="python3 -m kasa --host $G4_PLUG_ADDR state";;
+    *:cycle)       cmd_power off; note "off; waiting 10s"; sleep 10; cmd_power on; echo "power cycled; g4 wait"; return;;
+    *) die "usage: g4 power on|off|cycle|status";;
+  esac
+  hub "$c"; echo
+}
+
+cmd_boot() {
+  # Phase 4. Untested on real Tiger: bless flags need confirming on the G4 (bless -h).
+  local target="${1:-}" once="${2:-}" flags
+  rsh 'sudo -S true < /dev/null 2>/dev/null' || die "sudo needs a password on the G4; add the sudoers line from README-G4.txt"
+  case "$target" in
+    os9)   flags="--folder9 $(shquote "$G4_OS9_FOLDER") --use9";;
+    tiger) flags="--mount /";;
+    *) die "usage: g4 boot tiger|os9 [--once]";;
+  esac
+  if [ "$once" = --once ]; then flags="$flags --nextonly"; else flags="$flags --setBoot"; fi
+  rsh "sudo -S bless $flags < /dev/null" || die "bless refused those flags; check bless -h on this Tiger"
+  rsh 'sudo -S reboot < /dev/null' >/dev/null 2>&1; echo "blessed $target ($flags); rebooting"
+}
+
+usage() { sed -n '2,27p' "$0"; }
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    doctor) cmd_doctor "$@";;   status) cmd_status "$@";;
+    push) cmd_push "$@";;       push-bin) cmd_push_bin "$@";;
+    assets) cmd_assets "$@";;   ini) cmd_ini "$@";;          setup-key) cmd_setup_key "$@";;
+    run) cmd_run "$@";;         stop) cmd_stop "$@";;        log) cmd_log "$@";;
+    shot) cmd_shot "$@";;       crash) cmd_crash "$@";;
+    keys) cmd_keys "$@";;       key) cmd_key "$@";;
+    pull) cmd_pull "$@";;       ssh) cmd_ssh "$@";;          wait) cmd_wait "$@";;
+    vnc) cmd_vnc "$@";;         reboot) cmd_reboot "$@";;    shutdown) cmd_shutdown "$@";;
+    power) cmd_power "$@";;     boot) cmd_boot "$@";;
+    help|-h|--help) usage;;
+    *) usage; die "unknown command: $cmd";;
+  esac
+}
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then main "$@"; fi

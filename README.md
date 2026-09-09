@@ -73,3 +73,23 @@ Guest-side launch idiom that survives the agent's Ctrl+C:
 
 `README-WEEKEND.txt` — setup steps, expectations, and known quirks for the
 first run on the Power Mac G4 Quicksilver.
+
+### `g4/` — the real G4 as a remote test bench
+
+Everything needed to work on the Power Mac from anywhere once it sits on
+the wired LAN next to an always-on Linux box that is also on Tailscale.
+
+- `g4` — the helper. `g4 push`, `g4 run`, `g4 log -f`, `g4 shot`, `g4 crash`,
+  `g4 keys`, `g4 reboot`, `g4 power cycle` … all short SSH one-liners against
+  Tiger's own Remote Login. `g4 doctor` prints the negotiated SSH algorithms
+  and checks sudo, VNC, screencapture, assets. Config via `~/.config/g4/config`
+  (see `config.example`); point `G4_HOST=tiger-vm` at the QEMU guest for a dry run.
+- `setup-g4-route.sh` — run with sudo on the hub to advertise the wired LAN as a
+  Tailscale subnet route (Tiger cannot run Tailscale, so the hub is the door).
+- `README-G4.txt` — the one-time keyboard checklist for setup day, the daily
+  loop, and recovery.
+
+The Mac's `~/.ssh/config` needs the SHA-1-era algorithms Tiger's OpenSSH
+3.8/4.5 speaks (`KexAlgorithms +diffie-hellman-group-exchange-sha1,…`,
+`HostKeyAlgorithms +ssh-rsa`, `PubkeyAcceptedAlgorithms +ssh-rsa`) and an RSA
+key; the stanza is in `README-G4.txt`.
