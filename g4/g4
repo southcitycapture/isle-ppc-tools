@@ -268,9 +268,23 @@ REMOTE
 }
 
 cmd_crash() {
-  local f='$HOME/Library/Logs/CrashReporter/isle.crash.log'
-  if [ "${1:-}" = --all ]; then rsh "cat \"$f\" 2>/dev/null || echo '(no crash log)'"; return; fi
-  rsh "cat \"$f\" 2>/dev/null" | last_entry
+  # Tiger appends to isle.crash.log; Leopard writes dated isle_<ts>_<host>.crash
+  # files. Show the newest Leopard report if present, else the Tiger log.
+  if [ "${1:-}" = --all ]; then
+    rsh 'f=$(ls -t "$HOME/Library/Logs/CrashReporter"/isle_*.crash 2>/dev/null | head -1); [ -n "$f" ] && cat "$f" || cat "$HOME/Library/Logs/CrashReporter/isle.crash.log" 2>/dev/null || echo "(no crash log)"'
+    return
+  fi
+  rsh 'f=$(ls -t "$HOME/Library/Logs/CrashReporter"/isle_*.crash 2>/dev/null | head -1); if [ -n "$f" ]; then echo "--- $(basename "$f") ---"; cat "$f"; else cat "$HOME/Library/Logs/CrashReporter/isle.crash.log" 2>/dev/null; fi' | crash_view
+}
+# Leopard reports are whole files (show the crashed-thread backtrace); Tiger
+# appends entries separated by asterisks (show the last). Handle both.
+crash_view() {
+  local body; body=$(cat)
+  if printf '%s' "$body" | grep -q '^Thread [0-9]* Crashed:'; then
+    printf '%s\n' "$body"        # Leopard: whole report
+  else
+    printf '%s' "$body" | last_entry  # Tiger: last appended entry
+  fi
 }
 # Tiger's CrashReporter appends entries separated by a line of asterisks; print the last one.
 last_entry() {
