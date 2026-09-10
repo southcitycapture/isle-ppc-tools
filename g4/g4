@@ -5,6 +5,7 @@
 #   g4 status                   uptime, is isle running, last log lines
 #   g4 push [isle.app]          ship a whole bundle           (default: $G4_APP)
 #   g4 push-bin [isle]          ship only the executable into the remote bundle (default: $G4_BIN)
+#   g4 use [lego|sbk|NAME]      point ~/isle.app at a project bundle (the runner follows the link)
 #   g4 install-runner           install the console-session runner (once; needed by run/stop)
 #   g4 run [args...]            (re)start the game via the console runner, log to ~/isle-log.txt
 #   g4 stop                     stop the game via the console runner
@@ -89,6 +90,7 @@ if [ -f /tmp/g4doc.png ]; then
 else echo "screen:  screencapture FAILED"; fi
 rm -f /tmp/g4doc.png
 if [ -f "$HOME/.g4/runner.sh" ] && [ -f "$HOME/.g4/runner.log" ]; then echo "runner:  installed and has run ($(cat "$HOME/.g4/runner.log"))"; elif [ -f "$HOME/.g4/runner.sh" ]; then echo "runner:  installed, not started yet (starts at next login; g4 reboot)"; else echo "runner:  NOT installed (g4 install-runner) - g4 run needs it (SSH exec of a windowed app aborts on Tiger/Leopard)"; fi
+if [ -L "$HOME/$APP" ]; then echo "slot:    $APP -> $(readlink "$HOME/$APP")"; fi
 if [ -x "$APP/Contents/MacOS/isle" ]; then echo "app:     $(ls -la "$APP/Contents/MacOS/isle" | awk '{print $5, $6, $7, $8}')"; else echo "app:     no $APP in home (g4 push)"; fi
 if [ -d gamedata/LEGO ]; then echo "assets:  gamedata $(du -sh gamedata 2>/dev/null | cut -f1)"; else echo "assets:  no gamedata (g4 assets)"; fi
 INI="$HOME/Library/Application Support/isledecomp/isle/isle.ini"
@@ -150,6 +152,26 @@ cmd_setup_key() {
   note "installing $pub on $G4_HOST; enter the G4 user's password when asked"
   ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive "$G4_HOST" \
     'umask 077; mkdir -p .ssh; cat >> .ssh/authorized_keys; echo "installed; $(wc -l < .ssh/authorized_keys | tr -d " ") key(s) on file"' < "$pub"
+}
+
+# Several ports share one runner slot: ~/isle.app is a symlink and the runner
+# launches whatever it points at. `use` flips it; push-bin/run/shot follow it.
+cmd_use() {
+  local target
+  case "${1:-}" in
+    "")   rsh 'if [ -L "$HOME/isle.app" ]; then echo "isle.app -> $(readlink "$HOME/isle.app")"; else echo "isle.app is a real directory (no project link)"; fi; echo "available:"; ls -d "$HOME"/*.app "$HOME"/isle.app.* 2>/dev/null | sed "s#^$HOME/#  #"'; return;;
+    lego) target="isle.app.lego";;
+    sbk)  target="SnowboardKids.app";;
+    *)    target="$1";;
+  esac
+  rscript T="$target" <<'REMOTE'
+[ -d "$HOME/$T" ] || { echo "no $HOME/$T on the G4"; exit 1; }
+if [ -e "$HOME/isle.app" ] && [ ! -L "$HOME/isle.app" ]; then
+  echo "isle.app is a real directory; refusing to replace it (move it aside first: mv isle.app isle.app.lego)"; exit 1
+fi
+killall isle 2>/dev/null
+ln -sfn "$T" "$HOME/isle.app" && echo "isle.app -> $(readlink "$HOME/isle.app")"
+REMOTE
 }
 
 # --- running ---------------------------------------------------------------
@@ -381,7 +403,7 @@ cmd_boot() {
   rsh 'sudo -S reboot < /dev/null' >/dev/null 2>&1; echo "blessed $target ($flags); rebooting"
 }
 
-usage() { sed -n '2,28p' "$0"; }
+usage() { sed -n '2,29p' "$0"; }
 
 main() {
   local cmd="${1:-help}"; shift || true
@@ -390,6 +412,7 @@ main() {
     push) cmd_push "$@";;       push-bin) cmd_push_bin "$@";;
     assets) cmd_assets "$@";;   ini) cmd_ini "$@";;          setup-key) cmd_setup_key "$@";;
     install-runner) cmd_install_runner "$@";;
+    use) cmd_use "$@";;
     run) cmd_run "$@";;         stop) cmd_stop "$@";;        log) cmd_log "$@";;
     shot) cmd_shot "$@";;       crash) cmd_crash "$@";;
     keys) cmd_keys "$@";;       key) cmd_key "$@";;
