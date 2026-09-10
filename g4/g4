@@ -334,8 +334,8 @@ cmd_wait() {
 
 cmd_vnc() { open "vnc://$G4_VNC"; }
 
-cmd_reboot()   { rsh 'sudo -S true < /dev/null 2>/dev/null' || die "sudo needs a password on the G4; add the sudoers line from README-G4.txt"; rsh 'sudo -S reboot < /dev/null' >/dev/null 2>&1; echo "reboot requested; g4 wait"; }
-cmd_shutdown() { rsh 'sudo -S true < /dev/null 2>/dev/null' || die "sudo needs a password on the G4; add the sudoers line from README-G4.txt"; rsh 'sudo -S shutdown -h now < /dev/null' >/dev/null 2>&1; echo "shutdown requested; bring it back with g4 power cycle"; }
+cmd_reboot()   { rsh 'sudo -S /usr/sbin/bless --info / < /dev/null > /dev/null 2>&1' || die "sudo needs a password on the G4; add the sudoers line from README-G4.txt"; rsh 'sudo -S reboot < /dev/null' >/dev/null 2>&1; echo "reboot requested; g4 wait"; }
+cmd_shutdown() { rsh 'sudo -S /usr/sbin/bless --info / < /dev/null > /dev/null 2>&1' || die "sudo needs a password on the G4; add the sudoers line from README-G4.txt"; rsh 'sudo -S shutdown -h now < /dev/null' >/dev/null 2>&1; echo "shutdown requested; bring it back with g4 power cycle"; }
 
 cmd_power() {
   local what="${1:-status}" c
@@ -356,7 +356,7 @@ cmd_power() {
 cmd_boot() {
   # Phase 4. Untested on real Tiger: bless flags need confirming on the G4 (bless -h).
   local target="${1:-}" once="${2:-}" flags
-  rsh 'sudo -S true < /dev/null 2>/dev/null' || die "sudo needs a password on the G4; add the sudoers line from README-G4.txt"
+  rsh 'sudo -S /usr/sbin/bless --info / < /dev/null > /dev/null 2>&1' || die "sudo needs a password on the G4; add the sudoers line from README-G4.txt"
   case "$target" in
     os9)   flags="--folder9 $(shquote "$G4_OS9_FOLDER") --use9";;
     tiger) flags="--mount /";;
